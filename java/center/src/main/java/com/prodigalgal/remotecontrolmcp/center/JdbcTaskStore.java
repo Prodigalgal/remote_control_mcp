@@ -849,13 +849,13 @@ final class JdbcTaskStore {
                     jdbc.update("""
                         UPDATE rcm_task SET status = CASE WHEN status IN (?, ?) AND timeout_seconds <= 0 THEN ? ELSE status END,
                         started_at = CASE WHEN status IN (?, ?) AND timeout_seconds <= 0 AND started_at IS NULL THEN ? ELSE started_at END,
-                        lease_until = CASE WHEN status IN (?, ?, ?) AND timeout_seconds <= 0 THEN ? ELSE lease_until END,
+                        lease_until = CASE WHEN status = ? OR (status IN (?, ?) AND timeout_seconds <= 0) THEN ? ELSE lease_until END,
                         updated_at = CURRENT_TIMESTAMP
-                     WHERE agent_id = ? AND task_id = ? AND timeout_seconds <= 0 AND status IN (?, ?, ?)
+                     WHERE agent_id = ? AND task_id = ? AND status IN (?, ?, ?) AND (timeout_seconds <= 0 OR status = ?)
                     """, TaskStatus.DISPATCHING, TaskStatus.QUEUED, TaskStatus.RUNNING,
                     TaskStatus.DISPATCHING, TaskStatus.QUEUED, timestamp(now),
-                    TaskStatus.DISPATCHING, TaskStatus.RUNNING, TaskStatus.QUEUED, timestamp(lease), machineId, taskId,
-                    TaskStatus.DISPATCHING, TaskStatus.RUNNING, TaskStatus.QUEUED);
+                    TaskStatus.RUNNING, TaskStatus.DISPATCHING, TaskStatus.QUEUED, timestamp(lease), machineId, taskId,
+                    TaskStatus.DISPATCHING, TaskStatus.RUNNING, TaskStatus.QUEUED, TaskStatus.RUNNING);
         }
     }
 

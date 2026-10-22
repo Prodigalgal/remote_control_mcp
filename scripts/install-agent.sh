@@ -102,6 +102,7 @@ max_rss_bytes="${REMOTE_CONTROL_MCP_AGENT_MAX_RSS_BYTES:-0}"
 max_cpu_seconds="${REMOTE_CONTROL_MCP_AGENT_MAX_CPU_SECONDS:-0}"
 resource_sample_interval="${REMOTE_CONTROL_MCP_AGENT_RESOURCE_SAMPLE_INTERVAL_MS:-1000}"
 transfer_stall_timeout="${REMOTE_CONTROL_MCP_AGENT_TRANSFER_STALL_TIMEOUT_SECONDS:-120}"
+registration_timeout="${REMOTE_CONTROL_MCP_AGENT_REGISTRATION_TIMEOUT_SECONDS:-90}"
 cgroup_path="${REMOTE_CONTROL_MCP_AGENT_CGROUP_PATH:-}"
 [[ "$browser_profile_dir" != *$'\r'* && "$browser_profile_dir" != *$'\n'* && ${#browser_profile_dir} -le 4096 ]] || {
   echo "REMOTE_CONTROL_MCP_AGENT_BROWSER_PROFILE_DIR must be a single path up to 4096 characters" >&2; exit 1;
@@ -182,6 +183,13 @@ done
 (( max_cpu_seconds <= 2592000 )) || { echo "REMOTE_CONTROL_MCP_AGENT_MAX_CPU_SECONDS must be between 0 and 2592000" >&2; exit 1; }
 (( resource_sample_interval >= 250 && resource_sample_interval <= 10000 )) || { echo "REMOTE_CONTROL_MCP_AGENT_RESOURCE_SAMPLE_INTERVAL_MS must be between 250 and 10000" >&2; exit 1; }
 (( transfer_stall_timeout >= 5 && transfer_stall_timeout <= 3600 )) || { echo "REMOTE_CONTROL_MCP_AGENT_TRANSFER_STALL_TIMEOUT_SECONDS must be between 5 and 3600" >&2; exit 1; }
+[[ "$registration_timeout" =~ ^[0-9]+$ ]] && (( registration_timeout >= 15 && registration_timeout <= 600 )) || {
+  echo "REMOTE_CONTROL_MCP_AGENT_REGISTRATION_TIMEOUT_SECONDS must be between 15 and 600" >&2; exit 1;
+}
+if [[ "$re_enroll" == true || ! -f "$state_dir/identity.json" ]]; then
+  : "${REMOTE_CONTROL_MCP_AGENT_ENROLLMENT_TOKEN:?required for first registration or re-enroll}"
+  command -v timeout >/dev/null 2>&1 || { echo 'timeout is required to bound Agent registration' >&2; exit 1; }
+fi
 
 install -d -m 0755 "$install_root"
 install -d -m 0700 "$state_dir"
@@ -365,10 +373,11 @@ if [[ "$re_enroll" == true || ! -f "$identity" ]]; then
   REMOTE_CONTROL_MCP_AGENT_RESOURCE_SAMPLE_INTERVAL_MS="$resource_sample_interval" \
   REMOTE_CONTROL_MCP_AGENT_TRANSFER_STALL_TIMEOUT_SECONDS="$transfer_stall_timeout" \
   REMOTE_CONTROL_MCP_AGENT_CGROUP_PATH="$cgroup_path" \
-  "$install_root/rcm-agent" --register-once >"$tmp_log" 2>&1
+  timeout --kill-after=5s "$registration_timeout" "$install_root/rcm-agent" --register-once >"$tmp_log" 2>&1
   rc=$?
   set -e
   if (( rc != 0 )) || [[ ! -f "$identity" ]]; then
+    if (( rc == 124 || rc == 137 )); then echo "Agent registration timed out after $registration_timeout seconds" >&2; fi
     echo "Java Agent registration failed:" >&2
     sed -n '1,80p' "$tmp_log" >&2
     rm -f "$tmp_log"

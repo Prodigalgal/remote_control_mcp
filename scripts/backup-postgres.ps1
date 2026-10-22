@@ -30,7 +30,7 @@ $temporary = "$destination.$([Guid]::NewGuid().ToString('N')).tmp"
 $previousPassword = [Environment]::GetEnvironmentVariable('PGPASSWORD', 'Process')
 try {
     if (-not [string]::IsNullOrEmpty($Password)) { $env:PGPASSWORD = $Password }
-    $arguments = @('--format=custom', '--no-owner', '--no-acl', '--host', $PgHost, '--port', $Port.ToString(), '--username', $Username, '--dbname', $Database, '--file', $temporary)
+    $arguments = @('--no-password', '--format=custom', '--no-owner', '--no-acl', '--host', $PgHost, '--port', $Port.ToString(), '--username', $Username, '--dbname', $Database, '--file', $temporary)
     & pg_dump @arguments
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $temporary -PathType Leaf)) {
         throw "pg_dump failed with exit code $LASTEXITCODE."

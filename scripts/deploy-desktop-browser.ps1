@@ -27,13 +27,14 @@ function Resolve-PowerShell7Path {
     if (-not [string]::IsNullOrWhiteSpace($env:REMOTE_CONTROL_MCP_PWSH_PATH)) {
         [void]$candidates.Add($env:REMOTE_CONTROL_MCP_PWSH_PATH)
     }
-    foreach ($package in @(Get-AppxPackage -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
+    [void]$candidates.Add((Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
+    foreach ($package in @(@(Get-AppxPackage -AllUsers -Name Microsoft.PowerShell -ErrorAction SilentlyContinue) +
+        @(Get-AppxPackage -Name Microsoft.PowerShell -ErrorAction SilentlyContinue) |
         Sort-Object Version -Descending | Select-Object -First 1)) {
         if (-not [string]::IsNullOrWhiteSpace($package.InstallLocation)) {
             [void]$candidates.Add((Join-Path $package.InstallLocation 'pwsh.exe'))
         }
     }
-    [void]$candidates.Add((Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
     foreach ($commandName in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($command -and $command.Source) { [void]$candidates.Add([string]$command.Source) }
@@ -45,6 +46,33 @@ function Resolve-PowerShell7Path {
         } catch { }
     }
     throw 'PowerShell 7 was not found. Install Microsoft.PowerShell 7 or set REMOTE_CONTROL_MCP_PWSH_PATH to pwsh.exe.'
+}
+
+function Save-Download {
+    param([string]$Uri, [string]$Destination, [int]$TimeoutSeconds = 30)
+    $temporary = "$Destination.$([Guid]::NewGuid().ToString('N')).download"
+    try {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $temporary -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+                Move-Item -LiteralPath $temporary -Destination $Destination -Force
+                return
+            } catch {
+                $statusCode = $null
+                if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+                }
+                $networkFailure = $_.Exception -is [Net.WebException] -or $_.Exception -is [OperationCanceledException] -or
+                    $_.Exception -is [TimeoutException] -or $_.Exception.GetType().FullName -eq 'System.Net.Http.HttpRequestException'
+                if ($attempt -eq 3 -or ($null -eq $statusCode -and -not $networkFailure) -or
+                    ($null -ne $statusCode -and $statusCode -notin @(408, 429, 500, 502, 503, 504))) { throw }
+                Write-Warning "Temporary download failure; retry $attempt/3."
+                Start-Sleep -Seconds ([int][Math]::Pow(2, $attempt - 1))
+            }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($HostId)) { $HostId = $AgentName }
@@ -85,9 +113,13 @@ function Download-Verified {
     $url = "$releaseBase/$Asset"
     $zip = Join-Path $StageRoot $Asset
     $shaFile = "$zip.sha256"
-    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip -TimeoutSec 180
-    Invoke-WebRequest -UseBasicParsing -Uri "$url.sha256" -OutFile $shaFile -TimeoutSec 30
-    $expected = ((Get-Content -LiteralPath $shaFile -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+    Save-Download -Uri $url -Destination $zip -TimeoutSeconds 180
+    Save-Download -Uri "$url.sha256" -Destination $shaFile
+    $parts = ((Get-Content -LiteralPath $shaFile -Raw).Trim() -split '\s+')
+    if ($parts.Count -lt 2 -or $parts[0] -notmatch '^[0-9a-fA-F]{64}$' -or $parts[1].TrimStart('*') -ne $Asset) {
+        throw "invalid checksum sidecar for $Asset"
+    }
+    $expected = $parts[0].ToLowerInvariant()
     $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($expected -ne $actual) { throw "checksum mismatch for $Asset" }
     return $zip
@@ -109,15 +141,15 @@ $localInstaller = Join-Path $PSScriptRoot 'install-agent.ps1'
 if (Test-Path -LiteralPath $localInstaller -PathType Leaf) {
     Copy-Item -LiteralPath $localInstaller -Destination $installer -Force
 } else {
-    Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/scripts/install-agent.ps1" -OutFile $installer -TimeoutSec 30
+    Save-Download -Uri "$rawBase/scripts/install-agent.ps1" -Destination $installer
 }
 
 $runtime = Join-Path $StageRoot "browser-runtime"
 New-Item -ItemType Directory -Path $runtime -Force | Out-Null
 $worker = Join-Path $runtime "browser-worker.mjs"
-Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/scripts/browser-worker.mjs" -OutFile $worker -TimeoutSec 30
+Save-Download -Uri "$rawBase/scripts/browser-worker.mjs" -Destination $worker
 foreach ($name in @('package.json', 'package-lock.json', 'resolve-executable.mjs')) {
-    Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/scripts/browser-runtime/$name" -OutFile (Join-Path $runtime $name) -TimeoutSec 30
+    Save-Download -Uri "$rawBase/scripts/browser-runtime/$name" -Destination (Join-Path $runtime $name)
 }
 $node = if ([string]::IsNullOrWhiteSpace($NodePath)) {
     (Get-Command node.exe -ErrorAction Stop).Source
@@ -189,13 +221,15 @@ $applyLines = @(
     ('$desktopUser = {0}' -f (ConvertTo-PSLiteral $DesktopUser)),
     ('$browserProfileDir = {0}' -f (ConvertTo-PSLiteral $BrowserProfileDir)),
     ('$browserHeadless = {0}' -f (ConvertTo-PSLiteral $BrowserHeadless)),
+    ('function Resolve-PowerShell7Path {' + [Environment]::NewLine + ${function:Resolve-PowerShell7Path}.ToString() + [Environment]::NewLine + '}'),
     'try {',
+    '  $pwsh = Resolve-PowerShell7Path',
     '  $u = (Get-CimInstance Win32_ComputerSystem).UserName',
     '  if ([string]::IsNullOrWhiteSpace($desktopUser)) { if (-not [string]::IsNullOrWhiteSpace($u)) { $desktopUser = $u.Substring($u.LastIndexOf([char]92) + 1) } }',
     '  if ([string]::IsNullOrWhiteSpace($desktopUser)) { throw "no interactive user; pass -DesktopUser for a not-yet-logged-in GUI host" }',
     '  $env:USERNAME = $desktopUser',
     '  $node = $nodePath',
-    ('  $env:REMOTE_CONTROL_MCP_PWSH_PATH = {0}' -f (ConvertTo-PSLiteral $pwsh)),
+    '  $env:REMOTE_CONTROL_MCP_PWSH_PATH = $pwsh',
     '  $worker = Join-Path $stage "browser-runtime\browser-worker.mjs"',
     # Keep the adapter executable invocation in a tiny .cmd shim.  Passing a
     # quoted multi-path command as one ProcessBuilder argument is parsed twice
@@ -210,7 +244,7 @@ $applyLines = @(
     ('  $agent = Join-Path $stage {0}' -f (ConvertTo-PSLiteral (Split-Path -Leaf $agentZip))),
     ('  $desktop = Join-Path $stage {0}' -f (ConvertTo-PSLiteral (Split-Path -Leaf $desktopZip))),
     ('  $browser = Join-Path $stage {0}' -f (ConvertTo-PSLiteral (Split-Path -Leaf $browserZip))),
-    ('  & {0} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer -BinaryPath $agent -AgentName $agentName -HostId $hostId -CenterUrl $centerUrl -DefaultCwd "C:\" -Capabilities "command,durable_tasks,desktop,browser,file_transfer" -Version $version -DesktopEnabled -DesktopBinaryPath $desktop -BrowserBinaryPath $browser -BrowserAdapter $adapter -BrowserEngine camoufox -BrowserName firefox -BrowserHeadless $browserHeadless -CamoufoxInstallDir $camoufoxInstallDir -BrowserProfileDir $browserProfileDir -MaxConcurrency 1 -MaxBrowserWorkers 1 -DesktopMaxLaunchedProcesses 16 -MaxChildProcesses 32 -MaxTotalChildProcesses 32' -f (ConvertTo-PSLiteral $pwsh)),
+    '  & $pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer -BinaryPath $agent -AgentName $agentName -HostId $hostId -CenterUrl $centerUrl -DefaultCwd "C:\" -Capabilities "command,durable_tasks,desktop,browser,file_transfer" -Version $version -DesktopEnabled -DesktopBinaryPath $desktop -BrowserBinaryPath $browser -BrowserAdapter $adapter -BrowserEngine camoufox -BrowserName firefox -BrowserHeadless $browserHeadless -CamoufoxInstallDir $camoufoxInstallDir -BrowserProfileDir $browserProfileDir -MaxConcurrency 1 -MaxBrowserWorkers 1 -DesktopMaxLaunchedProcesses 16 -MaxChildProcesses 32 -MaxTotalChildProcesses 32',
     '  if ($LASTEXITCODE -ne 0) { throw "agent installer failed with exit $LASTEXITCODE" }',
     '  try { Start-ScheduledTask -TaskName "RemoteControlMCPDesktopCompanion" -ErrorAction Stop } catch { }',
     '  Start-Sleep -Seconds 3',
@@ -225,7 +259,9 @@ $applyLines = @(
 )
 Set-Content -LiteralPath $apply -Value ($applyLines -join [Environment]::NewLine) -Encoding Unicode -Force
 
-$action = New-ScheduledTaskAction -Execute $pwsh -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $apply)
+$taskHost = Join-Path ([Environment]::GetFolderPath('Windows')) 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path -LiteralPath $taskHost -PathType Leaf)) { throw "Windows PowerShell task host is missing: $taskHost" }
+$action = New-ScheduledTaskAction -Execute $taskHost -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $apply)
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(15)
 $applyPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 Unregister-ScheduledTask -TaskName $applyTaskName -Confirm:$false -ErrorAction SilentlyContinue

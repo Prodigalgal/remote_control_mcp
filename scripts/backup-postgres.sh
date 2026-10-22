@@ -29,7 +29,7 @@ temporary="$destination.$RANDOM.tmp"
 cleanup() { rm -f -- "$temporary"; }
 trap cleanup EXIT
 
-pg_dump --format=custom --no-owner --no-acl \
+pg_dump --no-password --format=custom --no-owner --no-acl \
   --host "$PGHOST_VALUE" --port "$PGPORT_VALUE" --username "$PGUSER_VALUE" \
   --dbname "$PGDATABASE_VALUE" --file "$temporary"
 pg_restore --list "$temporary" >/dev/null

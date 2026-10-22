@@ -83,7 +83,7 @@ function Set-LiveSecretValue([string]$SecretKey, [string]$Value) {
 }
 
 function Test-NewCredential([string]$Token) {
-    Invoke-RestMethod -Uri "$ConsoleUrl/api/v1/admin/machines" -Headers @{ Authorization = "Bearer $Token" } | Out-Null
+    Invoke-RestMethod -Uri "$ConsoleUrl/api/v1/admin/machines" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 15 | Out-Null
 }
 
 if (-not (Test-Path -LiteralPath $EnvFile)) {
@@ -120,7 +120,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Center rollout did not complete."
     }
-    $health = Invoke-RestMethod -Uri "$McpUrl/healthz"
+    $health = Invoke-RestMethod -Uri "$McpUrl/api/v1/healthz" -TimeoutSec 15
     if ($health.status -ne "ok") {
         throw "Center health check failed."
     }
