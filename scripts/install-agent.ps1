@@ -24,6 +24,8 @@ param(
     [string]$BrowserBinaryPath = "",
     [string]$UpdaterBinaryPath = "",
     [switch]$DesktopEnabled,
+    [ValidateRange(15, 600)]
+    [int]$RegistrationTimeoutSeconds = 90,
     [ValidateRange(1, 32)]
     [int]$MaxConcurrency = 1,
     [ValidateRange(1, 8)]
@@ -139,29 +141,44 @@ function Stop-AgentProcessForReplacement {
     throw "Agent process did not exit before bundle replacement."
 }
 
-function Resolve-PowerShell7Path {
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    if (-not [string]::IsNullOrWhiteSpace($env:REMOTE_CONTROL_MCP_PWSH_PATH)) {
-        [void]$candidates.Add($env:REMOTE_CONTROL_MCP_PWSH_PATH)
+function Resolve-AgentTaskHostPath {
+    # Only installation needs PowerShell 7. The generated runtime launcher is
+    # PowerShell 5.1 compatible: use the Windows-owned host, whose location is
+    # stable across Store/MSIX updates and available to SYSTEM before logon.
+    $hostPath = Join-Path ([Environment]::GetFolderPath('Windows')) 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
+        throw "Windows PowerShell task host is missing: $hostPath. No versioned/user-scoped host will be registered."
     }
-    foreach ($package in @(Get-AppxPackage -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
-        Sort-Object Version -Descending | Select-Object -First 1)) {
-        if (-not [string]::IsNullOrWhiteSpace($package.InstallLocation)) {
-            [void]$candidates.Add((Join-Path $package.InstallLocation 'pwsh.exe'))
+    return $hostPath
+}
+
+function Resolve-AgentInstallPaths([string]$InstallRoot, [string]$StateDir) {
+    $resolved = @{}
+    foreach ($entry in @(@{Name='InstallRoot';Value=$InstallRoot}, @{Name='StateDir';Value=$StateDir})) {
+        if ($entry.Value -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)') {
+            throw "$($entry.Name) must be an absolute directory path."
         }
+        $fullPath = [IO.Path]::GetFullPath($entry.Value)
+        $path = $fullPath.TrimEnd('\','/')
+        if ($path -ieq [IO.Path]::GetPathRoot($fullPath).TrimEnd('\','/')) {
+            throw "$($entry.Name) cannot be a drive root or a protected system/profile directory."
+        }
+        $protected = @($env:SystemRoot, $env:ProgramFiles,
+            ${env:ProgramFiles(x86)}, $env:ProgramData, [Environment]::GetFolderPath('UserProfile'))
+        foreach ($directory in $protected) {
+            if ($directory -and $path -ieq ([IO.Path]::GetFullPath($directory).TrimEnd('\','/'))) {
+                throw "$($entry.Name) cannot be a drive root or a protected system/profile directory."
+            }
+        }
+        $resolved[$entry.Name] = $path
     }
-    [void]$candidates.Add((Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
-    foreach ($commandName in @('pwsh.exe', 'pwsh')) {
-        $command = Get-Command $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($command -and $command.Source) { [void]$candidates.Add([string]$command.Source) }
+    $install = $resolved.InstallRoot
+    $state = $resolved.StateDir
+    if ($install -ieq $state -or $install.StartsWith($state + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            $state.StartsWith($install + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'InstallRoot and StateDir must be separate, non-overlapping directories.'
     }
-    foreach ($candidate in $candidates) {
-        try {
-            $resolved = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
-            if (Test-Path -LiteralPath $resolved -PathType Leaf) { return $resolved }
-        } catch { }
-    }
-    throw 'PowerShell 7 was not found. Install Microsoft.PowerShell 7 or set REMOTE_CONTROL_MCP_PWSH_PATH to pwsh.exe.'
+    return [pscustomobject]$resolved
 }
 
 function Register-AgentTask {
@@ -169,8 +186,8 @@ function Register-AgentTask {
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$LauncherPath
     )
-    $pwsh = Resolve-PowerShell7Path
-    $action = New-ScheduledTaskAction -Execute $pwsh -Argument (
+    $taskHost = Resolve-AgentTaskHostPath
+    $action = New-ScheduledTaskAction -Execute $taskHost -Argument (
         '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $LauncherPath)
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -184,17 +201,45 @@ function Register-AgentTask {
 }
 
 function Start-AgentTaskAndWait {
-    param([Parameter(Mandatory = $true)][string]$Name)
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 30
+    )
     Start-ScheduledTask -TaskName $Name
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $stableSince = $null
+    $stableProcessId = $null
     while ([DateTime]::UtcNow -lt $deadline) {
         $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
-        if ($task -and $task.State -eq 'Running') { return }
+        $agent = @(Get-CimInstance Win32_Process -Filter "Name='rcm-agent.exe'" |
+            Where-Object { $_.ExecutablePath -ieq $ExecutablePath })
+        if ($task -and $task.State -eq 'Running' -and $agent.Count -gt 0) {
+            if ($null -eq $stableSince -or $stableProcessId -ne $agent[0].ProcessId) {
+                $stableSince = [DateTime]::UtcNow
+                $stableProcessId = $agent[0].ProcessId
+            }
+            if (([DateTime]::UtcNow - $stableSince).TotalSeconds -ge 3) { return }
+        } else { $stableSince = $null }
         Start-Sleep -Milliseconds 250
     }
     $info = Get-ScheduledTaskInfo -TaskName $Name -ErrorAction SilentlyContinue
     $result = if ($info) { $info.LastTaskResult } else { 'unknown' }
-    throw "Remote Control MCP Java Agent task did not enter Running state (last result: $result)."
+    throw "Remote Control MCP Agent process did not remain running (task: $Name; last result: $result; binary: $ExecutablePath)."
+}
+
+function Assert-NativeArchive {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Executable)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or [IO.Path]::GetExtension($Path) -ine '.zip') {
+        throw "Expected a Native Image ZIP containing ${Executable}: $Path"
+    }
+    $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $Path).Path)
+    try {
+        $matches = @($archive.Entries | Where-Object { $_.Name -ieq $Executable })
+        if ($matches.Count -ne 1 -or $matches[0].FullName -ine $Executable) {
+            throw "Native Image ZIP must contain exactly one flat $Executable."
+        }
+    } finally { $archive.Dispose() }
 }
 
 if ($MaxTotalChildProcesses -eq 0) {
@@ -257,6 +302,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "PowerShell 7 or newer is required."
 }
+$targets = Resolve-AgentInstallPaths -InstallRoot $InstallRoot -StateDir $StateDir
+$InstallRoot = $targets.InstallRoot
+$StateDir = $targets.StateDir
 
 if ($Uninstall) {
     Remove-AgentTask -Name $serviceName
@@ -287,6 +335,26 @@ if ($MaxAggregateOutputBytes -lt $MaxOutputBytes -or $MaxAggregateOutputBytes -g
 }
 if ($MaxBrowserWorkers -gt $MaxConcurrency) {
         throw "MaxBrowserWorkers cannot exceed MaxConcurrency."
+}
+
+# Reject missing credentials, dependencies and malformed companion bundles
+# before stopping any currently working Agent or replacing its executable.
+[void](Resolve-AgentTaskHostPath)
+$identity = Join-Path $StateDir 'identity.json'
+if (($ReEnroll -or -not (Test-Path -LiteralPath $identity -PathType Leaf)) -and [string]::IsNullOrWhiteSpace($EnrollmentToken)) {
+    throw 'EnrollmentToken is required for first registration or -ReEnroll; the existing Agent was not stopped.'
+}
+Assert-NativeArchive -Path $BinaryPath -Executable 'rcm-agent.exe'
+foreach ($bundle in @(
+    @{Path=$DesktopBinaryPath;Executable='rcm-desktop-companion.exe'},
+    @{Path=$BrowserBinaryPath;Executable='rcm-browser-agent.exe'},
+    @{Path=$UpdaterBinaryPath;Executable='rcm-updater.exe'}
+)) {
+    if (-not [string]::IsNullOrWhiteSpace($bundle.Path)) { Assert-NativeArchive -Path $bundle.Path -Executable $bundle.Executable }
+}
+if ($DesktopEnabled -and [string]::IsNullOrWhiteSpace($DesktopBinaryPath) -and
+        -not (Test-Path -LiteralPath (Join-Path $InstallRoot 'desktop\rcm-desktop-companion.exe') -PathType Leaf)) {
+    throw 'DesktopEnabled requires an installed companion or DesktopBinaryPath; the existing Agent was not stopped.'
 }
 
 $destination = Join-Path $InstallRoot "rcm-agent.exe"
@@ -427,12 +495,17 @@ if ($ReEnroll -or -not (Test-Path -LiteralPath $identity -PathType Leaf)) {
     if (-not $registration.Start()) { throw "could not start Java Agent registration" }
     $stdout = $registration.StandardOutput.ReadToEndAsync()
     $stderr = $registration.StandardError.ReadToEndAsync()
-    $registration.WaitForExit()
-    if ($registration.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $identity -PathType Leaf)) {
-        $detail = if ($stderr.Result) { $stderr.Result.Trim() } else { $stdout.Result.Trim() }
-        throw "Java Agent registration failed (exit $($registration.ExitCode)): $detail"
-    }
-    $registration.Dispose()
+    try {
+        if (-not $registration.WaitForExit($RegistrationTimeoutSeconds * 1000)) {
+            try { $registration.Kill($true) } catch { }
+            [void]$registration.WaitForExit(5000)
+            throw "Agent registration timed out after $RegistrationTimeoutSeconds seconds; check Center reachability and the enrollment credential."
+        }
+        if ($registration.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $identity -PathType Leaf)) {
+            $detail = if ($stderr.Result) { $stderr.Result.Trim() } else { $stdout.Result.Trim() }
+            throw "Java Agent registration failed (exit $($registration.ExitCode)): $detail"
+        }
+    } finally { $registration.Dispose() }
 }
 
 $environment = [string[]]@(
@@ -497,8 +570,9 @@ foreach ($entry in $environment) {
 $launcherLines.Add('$binary = Join-Path $PSScriptRoot ''rcm-agent.exe''')
 $launcherLines.Add('& $binary --run')
 $launcherLines.Add('exit $LASTEXITCODE')
-# The startup task uses the machine-wide PowerShell 7 installation selected by
-# Register-AgentTask; write UTF-16LE so paths and machine names remain lossless.
+# Keep this launcher compatible with Windows PowerShell 5.1. Startup must not
+# depend on an MSIX version, a user profile, PATH, or the installing terminal.
+# Write UTF-16LE so paths and machine names remain lossless on both PS editions.
 Set-Content -LiteralPath $launcherPath -Value $launcherLines -Encoding Unicode -Force
 & icacls.exe $launcherPath /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
 # Keep the advertised version in sync with a direct reinstall as well as with
@@ -597,7 +671,7 @@ if ($DesktopEnabled) {
 }
 
 Register-AgentTask -Name $serviceName -LauncherPath $launcherPath
-Start-AgentTaskAndWait -Name $serviceName
+Start-AgentTaskAndWait -Name $serviceName -ExecutablePath $destination
 [pscustomobject]@{
     Task = $serviceName
     Status = (Get-ScheduledTask -TaskName $serviceName).State

@@ -43,7 +43,15 @@ GraalVM 运行时 DLL 会分别与 `rcm-center.exe`、`rcm-agent.exe` 放入各�
 
 `java/Dockerfile.*.native` 和 `web/Dockerfile` 同样要求构建参数 `RCM_CI_BUILD=true`；工作流会自动注入，本机直接 `docker build` 会在编译前拒绝执行。
 
-Windows 安装器 `scripts/install-agent.ps1` 的 `-BinaryPath` 只接收平铺 command-agent ZIP；`-DesktopBinaryPath` 和 `-BrowserBinaryPath` 只接收两个独立 companion ZIP，安装到隔离子目录，避免 `java.dll`/`jvm.dll` 同名覆盖。它会在复制完整 bundle 前停止旧启动任务和桌面计划任务，避免只替换 exe 造成运行时 DLL 不匹配；command-agent 由内置 Task Scheduler 以 SYSTEM 启动，Native Image 不再被误注册为 SCM 服务。启用 Desktop 时，登录触发任务使用 `wscript.exe //B //NoLogo` 调用生成的 VBS 启动器，避免 PowerShell 窗口在登录阶段短暂闪现；安装器和启动任务统一要求机器级 PowerShell 7。
+Windows 安装器 `scripts/install-agent.ps1` 的 `-BinaryPath` 只接收平铺 command-agent ZIP；`-DesktopBinaryPath` 和 `-BrowserBinaryPath` 只接收两个独立 companion ZIP，安装到隔离子目录，避免 `java.dll`/`jvm.dll` 同名覆盖。凭据、启动宿主与所有 ZIP 先检查，再停止旧任务、替换完整 bundle。安装过程使用 PowerShell 7，注册最长等待 90 秒（可通过 `RegistrationTimeoutSeconds` 调整）；command-agent 的 SYSTEM 开机任务使用 Windows 自带的固定路径 `System32\WindowsPowerShell\v1.0\powershell.exe`，运行兼容 PowerShell 5.1 的轻量启动器，不依赖 Store/MSIX 版本目录、用户 PATH 或安装终端。启用 Desktop 时，登录触发任务使用 `wscript.exe //B //NoLogo` 调用生成的 VBS 启动器。
+
+若旧开机任务因 Store 自动更新出现 `0x80070002`（旧 PowerShell 路径不存在），在管理员终端执行 `scripts/repair-agent-task.ps1`。它先备份原任务 XML，仅更新启动宿主，保留身份、配置、开机触发器、SYSTEM 账户和原重试设置；实际 Agent 进程持续运行后才返回 `started`。仍需通过 Center 心跳和一条终态命令确认远程执行能力，不能仅用任务 Running 作为在线证明。
+
+Windows 下载脚本对临时网络错误最多尝试 3 次，每次有超时，使用临时文件完成下载后再发布；404、鉴权和 SHA-256 错误直接失败，不盲目重试安装。桌面/浏览器延后安装任务也使用 Windows 固定宿主，执行时重新发现 PowerShell 7，避免持久化 Store 的版本路径。`scripts/test-windows-scripts.ps1` 在 Windows PowerShell 5.1 下验证这些故障场景，PR 和 Agent 发布工作流均执行该门禁。
+
+睡眠机器需要硬件、驱动和 Windows 设备唤醒权限共同支持 WoL/WoWLAN；`powercfg /devicequery wake_programmable` 与 `wake_armed` 应分别核对，网卡高级属性启用 Magic Packet 不代表 Windows 已允许该设备唤醒。用同一局域网内仍在线的机器执行 `scripts/wake-machine.ps1 -MacAddress 02-11-22-33-44-55 -InterfaceAlias Ethernet`，按真实网卡和目标 MAC 替换参数。该脚本只向选定接口的子网广播发送最多 5 个唤醒包，发送成功只返回 `sent`；必须再核对 Windows 唤醒来源、Center 新心跳和终态命令才能确认唤醒成功。睡眠中的 Agent 无法自行接收并执行唤醒命令；中继机器离线、休眠、关机或断电的情况需要单独验收，不能用 S3 睡眠测试替代。
+
+Linux 首次注册也受默认 90 秒的进程超时限制，可通过 `REMOTE_CONTROL_MCP_AGENT_REGISTRATION_TIMEOUT_SECONDS` 在 15–600 秒之间调整；凭据与 `timeout` 命令在安装前检查。
 
 已安装旧版本若仍有登录黑框，可在管理员 PowerShell 7 中单独执行
 `scripts/repair-desktop-companion-task.ps1`；该脚本只更新桌面计划任务和 VBS 启动器，

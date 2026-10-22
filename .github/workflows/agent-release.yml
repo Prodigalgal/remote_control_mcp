@@ -224,6 +224,9 @@ jobs:
           distribution: graalvm-community
           github-token: ${{ secrets.GITHUB_TOKEN }}
           native-image-job-reports: false
+      - name: Verify Windows script recovery contracts
+        shell: powershell
+        run: .\scripts\test-windows-scripts.ps1
       - name: Build Agent and updater Native Images
         working-directory: java
         shell: pwsh
@@ -267,7 +270,7 @@ jobs:
           Get-ChildItem java/desktop/build/native/nativeCompile/*.dll -File -ErrorAction SilentlyContinue | Copy-Item -Destination $desktopOut
           Get-ChildItem java/browser/build/native/nativeCompile/*.dll -File -ErrorAction SilentlyContinue | Copy-Item -Destination $browserOut
           Get-ChildItem java/updater/build/native/nativeCompile/*.dll -File -ErrorAction SilentlyContinue | Copy-Item -Destination $updaterOut
-          Copy-Item scripts/install-agent.ps1, scripts/first-install-agent.ps1, README.md, LICENSE, NOTICE $out
+          Copy-Item scripts/install-agent.ps1, scripts/first-install-agent.ps1, scripts/repair-agent-task.ps1, scripts/wake-machine.ps1, README.md, LICENSE, NOTICE $out
           foreach ($bundle in @($agentOut,$desktopOut,$browserOut,$updaterOut)) {
             Get-FileHash (Get-ChildItem $bundle -File | Where-Object { $_.Extension -in '.exe','.dll' }) -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content (Join-Path $bundle 'SHA256SUMS') -Encoding ascii
           }

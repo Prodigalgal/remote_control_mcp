@@ -12,13 +12,17 @@ try {
 
 Write-Host '== Java tests ==' -ForegroundColor Cyan
 & $gradle test --no-daemon
+if ($LASTEXITCODE -ne 0) { throw "Java tests failed (exit $LASTEXITCODE)." }
 
 Write-Host '== JVM artifacts ==' -ForegroundColor Cyan
 & $gradle :center:bootJar :agent:jar :desktop:jar :browser:jar --no-daemon
+if ($LASTEXITCODE -ne 0) { throw "JVM artifact build failed (exit $LASTEXITCODE)." }
 
 Write-Host '== React production build ==' -ForegroundColor Cyan
 pnpm --dir (Join-Path $root 'web') install --frozen-lockfile
+if ($LASTEXITCODE -ne 0) { throw "Console dependency installation failed (exit $LASTEXITCODE)." }
 pnpm --dir (Join-Path $root 'web') build
+if ($LASTEXITCODE -ne 0) { throw "Console build failed (exit $LASTEXITCODE)." }
 } finally {
     Pop-Location
 }

@@ -27,13 +27,13 @@ function Resolve-PowerShell7Path {
     if (-not [string]::IsNullOrWhiteSpace($env:REMOTE_CONTROL_MCP_PWSH_PATH)) {
         [void]$candidates.Add($env:REMOTE_CONTROL_MCP_PWSH_PATH)
     }
+    [void]$candidates.Add((Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
     foreach ($package in @(Get-AppxPackage -Name Microsoft.PowerShell -ErrorAction SilentlyContinue |
         Sort-Object Version -Descending | Select-Object -First 1)) {
         if (-not [string]::IsNullOrWhiteSpace($package.InstallLocation)) {
             [void]$candidates.Add((Join-Path $package.InstallLocation 'pwsh.exe'))
         }
     }
-    [void]$candidates.Add((Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'))
     foreach ($commandName in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($command -and $command.Source) { [void]$candidates.Add([string]$command.Source) }
@@ -45,6 +45,33 @@ function Resolve-PowerShell7Path {
         } catch { }
     }
     throw 'PowerShell 7 was not found. Install Microsoft.PowerShell 7 or set REMOTE_CONTROL_MCP_PWSH_PATH to pwsh.exe.'
+}
+
+function Save-Download {
+    param([string]$Uri, [string]$Destination, [int]$TimeoutSeconds = 30)
+    $temporary = "$Destination.$([Guid]::NewGuid().ToString('N')).download"
+    try {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $temporary -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+                Move-Item -LiteralPath $temporary -Destination $Destination -Force
+                return
+            } catch {
+                $statusCode = $null
+                if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+                }
+                $networkFailure = $_.Exception -is [Net.WebException] -or $_.Exception -is [OperationCanceledException] -or
+                    $_.Exception -is [TimeoutException] -or $_.Exception.GetType().FullName -eq 'System.Net.Http.HttpRequestException'
+                if ($attempt -eq 3 -or ($null -eq $statusCode -and -not $networkFailure) -or
+                    ($null -ne $statusCode -and $statusCode -notin @(408, 429, 500, 502, 503, 504))) { throw }
+                Write-Warning "Temporary download failure; retry $attempt/3."
+                Start-Sleep -Seconds ([int][Math]::Pow(2, $attempt - 1))
+            }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function ConvertTo-CliArgument {
@@ -117,10 +144,10 @@ try {
         param([Parameter(Mandatory = $true)][string]$Asset, [switch]$Optional)
         $destination = Join-Path $stage $Asset
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$Asset" -OutFile $destination -TimeoutSec 180
+            Save-Download -Uri "$releaseBase/$Asset" -Destination $destination -TimeoutSeconds 180
         } catch {
             $statusCode = $null
-            if ($_.Exception.Response) {
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
                 try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
             }
             if ($Optional -and $statusCode -eq 404) {
@@ -131,7 +158,7 @@ try {
             throw
         }
         $sidecar = "$destination.sha256"
-        Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$Asset.sha256" -OutFile $sidecar -TimeoutSec 30
+        Save-Download -Uri "$releaseBase/$Asset.sha256" -Destination $sidecar
         $parts = ((Get-Content -LiteralPath $sidecar -Raw).Trim() -split '\s+')
         if ($parts.Count -lt 2 -or $parts[0] -notmatch '^[0-9a-fA-F]{64}$' -or ($parts[1].TrimStart('*') -ne $Asset)) { throw "invalid checksum sidecar for $Asset" }
         $actual = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -147,7 +174,7 @@ try {
     if ($Desktop) { $desktopZip = Download-Verified "remote-control-mcp-desktop-$Version-$arch.zip" }
     if ($Browser) { $browserZip = Download-Verified "remote-control-mcp-browser-$Version-$arch.zip" }
     $installer = Join-Path $stage 'install-agent.ps1'
-    Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/scripts/install-agent.ps1" -OutFile $installer -TimeoutSec 30
+    Save-Download -Uri "$rawBase/scripts/install-agent.ps1" -Destination $installer
 
     $adapter = ''
     if ($Browser) {
@@ -162,9 +189,9 @@ try {
         if (-not $npm) { throw 'Browser mode requires npm.cmd beside node.exe.' }
         $worker = Join-Path $runtime 'browser-worker.mjs'
         New-Item -ItemType Directory -Path $runtime, $camoufoxInstallDir -Force | Out-Null
-        Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/scripts/browser-worker.mjs" -OutFile $worker -TimeoutSec 30
+        Save-Download -Uri "$rawBase/scripts/browser-worker.mjs" -Destination $worker
         foreach ($name in @('package.json', 'package-lock.json', 'resolve-executable.mjs')) {
-            Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/scripts/browser-runtime/$name" -OutFile (Join-Path $runtime $name) -TimeoutSec 30
+            Save-Download -Uri "$rawBase/scripts/browser-runtime/$name" -Destination (Join-Path $runtime $name)
         }
         $nodeVersion = [version](& $NodePath -p 'process.versions.node')
         if ($nodeVersion -lt [version]'22.15.0') { throw 'Camoufox requires Node.js 22.15 or newer.' }

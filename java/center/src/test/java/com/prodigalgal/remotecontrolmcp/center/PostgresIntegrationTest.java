@@ -435,6 +435,28 @@ class PostgresIntegrationTest {
             }
         }
 
+        // A bounded command may legitimately outlive the two-minute dispatch
+        // lease. Polling must renew its RUNNING lease just like a durable task,
+        // without removing its original started_at or dispatch-attempt fence.
+        var boundedTaskId = "task_it_bounded_renew_" + UUID.randomUUID().toString().replace("-", "");
+        var boundedCommand = new TaskCommand(boundedTaskId, TaskKind.COMMAND, "command", "printf bounded", "/tmp",
+                Map.of(), 210, null, Instant.now());
+        store.create(boundedTaskId, agentId, boundedCommand, "bounded-renew-key", boundedCommand.createdAt());
+        var boundedLease = store.poll(agentId, new PollRequest(List.of(), 1, List.of("command"))).task();
+        assertEquals(boundedTaskId, boundedLease.id());
+        store.updateState(agentId, boundedTaskId,
+                new TaskUpdateRequest(TaskStatus.RUNNING, null, null, null, null, false), boundedLease.attempt());
+        var boundedStartedAt = store.find(boundedTaskId).orElseThrow().startedAt();
+        jdbc.update("UPDATE rcm_task SET lease_until = CURRENT_TIMESTAMP + INTERVAL '5 seconds' WHERE task_id = ?", boundedTaskId);
+        store.poll(agentId, new PollRequest(List.of(boundedTaskId), 0, List.of("command")));
+        var renewedBounded = store.find(boundedTaskId).orElseThrow();
+        assertTrue(renewedBounded.leaseUntil().isAfter(Instant.now().plusSeconds(90)),
+                "a live bounded task must not expire while its Agent keeps polling");
+        assertEquals(boundedStartedAt, renewedBounded.startedAt());
+        assertEquals(boundedLease.attempt(), renewedBounded.attempt());
+        store.updateState(agentId, boundedTaskId,
+                new TaskUpdateRequest(TaskStatus.COMPLETED, 0, null, null, null, false), boundedLease.attempt());
+
         // An Agent that disappears after a lease is claimed must not leave a
         // task permanently dispatching. A subsequent poll requeues and claims
         // it, while a fresh adapter instance can still read the same state.

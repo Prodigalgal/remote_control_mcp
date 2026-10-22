@@ -71,6 +71,7 @@ try {
     # Native Image is intentionally serialized; running Center and Agent
     # images together can consume several GiB per process.
     & $gradle -PnativeMarch=$nativeMarch :center:nativeCompile :agent:nativeCompile :desktop:nativeCompile :browser:nativeCompile :updater:nativeCompile --no-daemon --no-parallel
+    if ($LASTEXITCODE -ne 0) { throw "Native Image build failed (exit $LASTEXITCODE); existing build output will not be packaged." }
     $suffix = if ($os -eq 'windows') { '.exe' } else { '' }
     $center = Join-Path (Get-Location) "center\build\native\nativeCompile\rcm-center$suffix"
     $agent = Join-Path (Get-Location) "agent\build\native\nativeCompile\rcm-agent$suffix"

@@ -34,6 +34,7 @@ def matches(component: str, path: str) -> bool:
                                     "scripts/build-native", "scripts/verify-agent-boundaries.py",
                                     "scripts/detect-component-changes.py",
                                     "scripts/deploy-desktop-browser", "scripts/browser-worker",
+                                    "scripts/repair-agent-task", "scripts/test-windows-scripts", "scripts/wake-machine",
                                     "scripts/smoke-browser-runtime", "scripts/normalize-native-isa",
                                     "scripts/verify-native-bundle", "scripts/browser-runtime/", "deploy/systemd/"))
                 or path in {".github/workflows/agent-release.yml", ".github/workflows/agent-publish.yml",
