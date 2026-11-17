@@ -3,14 +3,17 @@ package com.prodigalgal.remotecontrolmcp.center;
 import com.prodigalgal.remotecontrolmcp.protocol.RuntimeEnvironment;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.springframework.stereotype.Component;
 
 /**
- * Runtime OAuth configuration for the ChatGPT-facing MCP resource.
+ * Runtime OAuth configuration for the MCP resource.
  *
  * <p>OAuth is deliberately opt-in.  The Center can therefore keep serving
  * existing Console-issued Bearer clients while a deployment rolls out the
@@ -30,6 +33,9 @@ public final class CenterOAuthConfig {
     private final Duration accessTokenTtl;
     private final Duration refreshTokenTtl;
     private final Set<String> scopes;
+    private final String geminiClientId;
+    private final String geminiClientSecret;
+    private final Set<String> geminiRedirectUris;
 
     public CenterOAuthConfig() {
         this(RuntimeEnvironment.snapshot());
@@ -46,6 +52,15 @@ public final class CenterOAuthConfig {
         this.accessTokenTtl = boundedSeconds(environment, "RCM_CENTER_OAUTH_ACCESS_TOKEN_TTL_SECONDS", 3600, 300, 86400);
         this.refreshTokenTtl = boundedSeconds(environment, "RCM_CENTER_OAUTH_REFRESH_TOKEN_TTL_SECONDS", 2592000, 3600, 315360000);
         this.scopes = parseScopes(environment.get("RCM_CENTER_OAUTH_SCOPES"));
+        this.geminiClientId = environment.getOrDefault("RCM_CENTER_OAUTH_GEMINI_CLIENT_ID", "");
+        this.geminiClientSecret = environment.getOrDefault("RCM_CENTER_OAUTH_GEMINI_CLIENT_SECRET", "");
+        this.geminiRedirectUris = parseGeminiRedirectUris(environment.get("RCM_CENTER_OAUTH_GEMINI_REDIRECT_URIS"));
+        if (!geminiClientId.isEmpty() || !geminiClientSecret.isEmpty() || !geminiRedirectUris.isEmpty()) {
+            if (!validCredential(geminiClientId) || geminiClientId.length() > 512 || !validCredential(geminiClientSecret)
+                    || isChatGptClientId(geminiClientId) || geminiRedirectUris.isEmpty()) {
+                throw new IllegalArgumentException("Gemini OAuth requires a client ID, client secret, and exact Google redirect URIs");
+            }
+        }
     }
 
     public boolean enabled() {
@@ -65,7 +80,13 @@ public final class CenterOAuthConfig {
     }
 
     public String protectedResourceMetadataUrl() {
-        return resource + "/.well-known/oauth-protected-resource";
+        var uri = URI.create(mcpResource());
+        return uri.getScheme() + "://" + uri.getRawAuthority()
+                + "/.well-known/oauth-protected-resource" + uri.getRawPath();
+    }
+
+    public String mcpResource() {
+        return resource.isEmpty() || resource.endsWith("/mcp") ? resource : resource + "/mcp";
     }
 
     public String authorizationServerMetadataUrl() {
@@ -101,15 +122,42 @@ public final class CenterOAuthConfig {
     }
 
     public boolean validResource(String candidate) {
-        return candidate == null || candidate.isBlank() || resource.equals(normalizeBase(candidate));
+        return candidate == null || candidate.isBlank() || resource.equals(normalizeBase(candidate))
+                || mcpResource().equals(normalizeBase(candidate));
     }
 
     public boolean validClientId(String clientId) {
+        return isGeminiClient(clientId) || isChatGptClientId(clientId);
+    }
+
+    public boolean isGeminiClient(String clientId) {
+        return clientId != null && !geminiClientId.isEmpty() && geminiClientId.equals(clientId);
+    }
+
+    public boolean validClientRedirect(String clientId, String redirectUri) {
+        if (isGeminiClient(clientId)) return redirectUri != null && geminiRedirectUris.contains(redirectUri);
+        return isChatGptClientId(clientId) && validChatGptRedirect(redirectUri);
+    }
+
+    public boolean authenticateClient(String clientId, String clientSecret) {
+        if (isGeminiClient(clientId)) {
+            return clientSecret != null && MessageDigest.isEqual(
+                    geminiClientSecret.getBytes(StandardCharsets.UTF_8), clientSecret.getBytes(StandardCharsets.UTF_8));
+        }
+        return isChatGptClientId(clientId) && (clientSecret == null || clientSecret.isEmpty());
+    }
+
+    public boolean geminiConfigured() {
+        return !geminiClientId.isEmpty();
+    }
+
+    private static boolean isChatGptClientId(String clientId) {
         if (clientId == null || clientId.isBlank()) return false;
         try {
             var uri = URI.create(clientId);
             return "https".equalsIgnoreCase(uri.getScheme())
                     && "chatgpt.com".equalsIgnoreCase(uri.getHost())
+                    && uri.getRawUserInfo() == null
                     && uri.getRawFragment() == null;
         } catch (IllegalArgumentException ignored) {
             return false;
@@ -117,6 +165,10 @@ public final class CenterOAuthConfig {
     }
 
     public boolean validRedirectUri(String redirectUri) {
+        return redirectUri != null && (geminiRedirectUris.contains(redirectUri) || validChatGptRedirect(redirectUri));
+    }
+
+    private static boolean validChatGptRedirect(String redirectUri) {
         if (redirectUri == null || redirectUri.isBlank()) return false;
         try {
             var uri = URI.create(redirectUri);
@@ -128,6 +180,40 @@ public final class CenterOAuthConfig {
         } catch (IllegalArgumentException ignored) {
             return false;
         }
+    }
+
+    private static Set<String> parseGeminiRedirectUris(String raw) {
+        if (raw == null || raw.isBlank()) return Set.of();
+        var uris = Arrays.stream(raw.split("[,\\s]+"))
+                .filter(value -> !value.isBlank()).collect(Collectors.toUnmodifiableSet());
+        if (uris.isEmpty() || uris.stream().anyMatch(value -> !validGoogleRedirect(value))) {
+            throw new IllegalArgumentException("RCM_CENTER_OAUTH_GEMINI_REDIRECT_URIS must contain exact Google HTTPS callback URIs");
+        }
+        return uris;
+    }
+
+    private static boolean validGoogleRedirect(String value) {
+        try {
+            if (value.length() > 2048) return false;
+            var uri = URI.create(value);
+            if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getRawUserInfo() != null
+                    || uri.getPort() != -1 || uri.getRawQuery() != null || uri.getRawFragment() != null) return false;
+            if ("vertexaisearch.cloud.google.com".equalsIgnoreCase(uri.getHost())) {
+                return "/oauth-redirect".equals(uri.getRawPath());
+            }
+            if (!Set.of("oauth-redirect.googleusercontent.com", "oauth-redirect-sandbox.googleusercontent.com",
+                    "oauth-redirect-test.googleusercontent.com").contains(uri.getHost())) return false;
+            var path = uri.getRawPath();
+            return path != null && path.length() > 3 && !path.contains("*")
+                    && (path.startsWith("/r/") || path.startsWith("/a/"));
+        } catch (IllegalArgumentException | NullPointerException ignored) {
+            return false;
+        }
+    }
+
+    private static boolean validCredential(String value) {
+        return value != null && !value.isBlank() && value.length() <= 1024
+                && value.equals(value.trim()) && value.chars().noneMatch(Character::isISOControl);
     }
 
     private static Duration boundedSeconds(java.util.Map<String, String> environment, String key,

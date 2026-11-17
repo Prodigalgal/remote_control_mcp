@@ -90,9 +90,15 @@ Console 使用部署时设置的 Admin Token 登录。MCP 客户端凭证和机�
 
 RCM 连接凭证用于换取 OAuth 令牌，不填写在 MCP 地址或 OAuth Client Secret 中。ChatGPT 的入口名称、开发者模式和可用操作受账号及工作区设置影响，当前步骤参考 [OpenAI 自定义 MCP 说明](https://developers.openai.com/api/docs/guides/custom-mcp-server)。新增工具后，在连接管理页面刷新工具定义，步骤见 [OpenAI 连接与测试说明](https://developers.openai.com/plugins/deploy/connect-chatgpt)。
 
-### 5. 在其他 MCP 客户端连接
+### 5. 在 Gemini 连接
 
-支持远程 HTTP MCP 的客户端可使用相同的 `/mcp` 地址和 OAuth。支持自定义认证头的客户端，也可直接使用 Console 生成的连接凭证：
+Center 可选配置一个预注册的 Gemini OAuth 客户端，并精确登记 Google 为应用提供的回调地址。管理员按[部署说明](docs/DEPLOYMENT.md)配置客户端 ID、密钥与回调地址后，在 Google Connected Console 或 Gemini Apps Developer Mode 中选择**预注册 / 手动客户端注册**，填写同一组 ID 和密钥，MCP 地址为 `https://<center-domain>/mcp`。连接时在 Center 授权页输入 Console 签发的 RCM 连接凭证。
+
+Center 要求 Authorization Code + PKCE（S256），Google 的客户端密钥与用户的 RCM 连接凭证是两种不同的凭据。首次上线仍需在实际 Google 环境完成授权和工具调用验收。Google 的配置入口见 [Connected Console 指南](https://developers.google.com/connected-apps/gpc/perform-the-steps)和 [Gemini Apps Developer Mode 指南](https://developers.google.com/connected-apps/mcp/dev-mode/usage)。
+
+### 6. 在其他 MCP 客户端连接
+
+支持远程 HTTP MCP 的客户端可使用相同的 `/mcp` 地址；OAuth 客户端需要被 Center 支持或配置。支持自定义认证头的客户端，也可直接使用 Console 生成的连接凭证：
 
 ```http
 Authorization: Bearer <Console 生成的 RCM 连接凭证>

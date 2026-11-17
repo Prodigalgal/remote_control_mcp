@@ -63,7 +63,7 @@ spec:
             # with the stable HTTPS Center hostname.
             - name: RCM_CENTER_PUBLIC_BASE_URL
               value: https://remote-control-mcp-center.example.invalid
-            # ChatGPT Web uses OAuth discovery; direct Codex/CLI clients use
+            # ChatGPT and the optional Gemini client use OAuth; direct clients use
             # Console-issued RCM Bearer credentials. Production overlays must
             # replace issuer/resource with the real HTTPS origin(s).
             - name: RCM_CENTER_OAUTH_ENABLED
@@ -74,6 +74,26 @@ spec:
               value: https://remote-control-mcp-center.example.invalid
             - name: RCM_CENTER_OAUTH_ALLOW_STATIC_TOKEN_BOOTSTRAP
               value: "true"
+            # Optional as a complete set. Configure app-specific redirect URIs;
+            # an incomplete set makes Center fail fast instead of weakening OAuth.
+            - name: RCM_CENTER_OAUTH_GEMINI_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: remote-control-mcp-secrets
+                  key: gemini-oauth-client-id
+                  optional: true
+            - name: RCM_CENTER_OAUTH_GEMINI_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: remote-control-mcp-secrets
+                  key: gemini-oauth-client-secret
+                  optional: true
+            - name: RCM_CENTER_OAUTH_GEMINI_REDIRECT_URIS
+              valueFrom:
+                secretKeyRef:
+                  name: remote-control-mcp-secrets
+                  key: gemini-oauth-redirect-uris
+                  optional: true
             - name: RCM_CENTER_TRANSFER_MAX_CONCURRENT
               value: "4"
             - name: RCM_CENTER_TRANSFER_MAX_PER_PRINCIPAL
