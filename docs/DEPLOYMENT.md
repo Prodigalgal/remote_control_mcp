@@ -127,7 +127,7 @@ Origin；它用于签名 Artifact URL 和 MCP Apps Viewer 的 CSP 元数据。`R
 签名使用独立的 `REMOTE_CONTROL_MCP_CENTER_ARTIFACT_SIGNING_SECRET`，不要复用 MCP
 或 Admin Token。
 
-启用混合认证后，Center 提供 `/.well-known/oauth-protected-resource`、
+启用混合认证后，Center 提供 `/.well-known/oauth-protected-resource`、`/.well-known/oauth-protected-resource/mcp`、
 `/.well-known/oauth-authorization-server`、`/oauth/authorize` 和 `/oauth/token`。
 ChatGPT Web 通过 Authorization Code + PKCE（S256）打开授权页；用户在 Console“连接凭证”
 创建 MCP 凭证时选择可访问的机器及每台机器上的工具，再在授权页输入该凭证。Center 只把它换成短期 OAuth access/refresh token，并继续按源凭证的权限矩阵校验调用。Codex/CLI 可直接携带
@@ -136,6 +136,26 @@ OAuth access/refresh token 失效。Center 不读取或接受进程级共享 MCP
 `REMOTE_CONTROL_MCP_CENTER_ADMIN_TOKEN` 仅用于 Console 管理 API，与 MCP 凭证用途分开。
 ChatGPT 连接器不支持自定义 API Key，且生产授权元数据不提供 DCR registration endpoint，优先走
 CIMD（`https://chatgpt.com/oauth/client.json`）。
+
+### Gemini OAuth 客户端
+
+Center 可选提供一个预注册的 Google 客户端。由管理员生成独立且难以猜测的客户端 ID 和高强度密钥；它们是 **Center 签发给 Google 的客户端凭据**，不是 Google Cloud 签发的 API 凭据，也不是 Console 签发的用户 RCM 连接凭证。三个设置必须同时提供，缺项或回调格式不合法会使 Center 启动失败；完全不设置则 Gemini 客户端关闭，现有 ChatGPT 接入不受影响。
+
+```text
+RCM_CENTER_OAUTH_GEMINI_CLIENT_ID=<generated-client-id>
+RCM_CENTER_OAUTH_GEMINI_CLIENT_SECRET=<generated-high-entropy-client-secret>
+RCM_CENTER_OAUTH_GEMINI_REDIRECT_URIS=https://oauth-redirect.googleusercontent.com/r/<exact-app-id>,https://oauth-redirect-test.googleusercontent.com/r/<exact-app-id>
+```
+
+在 Kubernetes 中可将三项分别放入 `remote-control-mcp-secrets` 的 `gemini-oauth-client-id`、`gemini-oauth-client-secret`、`gemini-oauth-redirect-uris` 键；基础 Deployment 以可选 Secret 引用读取。配置变更后按部署流程重启 Center。不要把真实密钥提交到仓库或填入 MCP Server URL。
+
+1. 在 [Google Connected Console](https://developers.google.com/connected-apps/gpc/perform-the-steps) 的服务器授权配置中查看 Google 为该应用生成的**完整回调 URI**，将实际需要的生产、测试和沙箱地址逐条加入 `RCM_CENTER_OAUTH_GEMINI_REDIRECT_URIS`，用逗号或空格分隔。Center 要求 HTTPS、无通配符并逐字精确匹配，只接受 Google 文档列出的 `oauth-redirect`、`oauth-redirect-sandbox`、`oauth-redirect-test` 域名的 `/r/` 或 `/a/` 回调。示例中的 ID 仅为占位符。Gemini Enterprise 使用时可登记 `https://vertexaisearch.cloud.google.com/oauth-redirect`。
+2. 在 Google 侧选择 **User-delegated (Authorization Code)** 和 **Pre-registered**，或在 Gemini Apps Developer Mode 选择 **Manual Client Registration**，填入同一客户端 ID 和密钥。Center 不实现 RFC 7591 动态客户端注册，不发布 `registration_endpoint`；不能选择依赖 DCR 的自动注册路径。Gemini Enterprise 使用预注册 OAuth 配置时需启用 PKCE；Center 同时接受 token 请求中的 HTTP Basic 和表单客户端密钥。
+3. MCP Server URL 填 `https://<center-domain>/mcp`；授权和 token URL 如需手动填写，分别使用 `https://<issuer>/oauth/authorize` 和 `https://<issuer>/oauth/token`。按需要请求 `mcp:read mcp:execute offline_access`，权限仍受用户源凭证约束。Google 必须能通过公网 HTTPS 访问 MCP、OAuth 元数据和授权端点；`RCM_CENTER_OAUTH_RESOURCE` 应与 MCP 公网域名对应。
+4. 在 Center 授权页输入用户自己的 Console MCP 连接凭证，完成回调后测试工具发现、调用、刷新和源凭证撤销。Gemini 客户端的刷新令牌遵循 Google 持久连接要求：成功刷新后复用原令牌并延长其有效期；源凭证被撤销或过期后仍会失效。现有 ChatGPT 客户端继续轮换刷新令牌。
+
+Center 的授权服务器元数据声明授权码、刷新、S256、scope 和实际支持的客户端认证方法，受保护资源元数据声明授权服务器和 Bearer 认证方式。Google 的[OAuth 接入要求](https://developers.google.com/connected-apps/mcp/oauth)及[回调排错说明](https://developers.google.com/connected-apps/gpc/troubleshooting)可能更新，应以接入时的实际配置为准。
+当 `RCM_CENTER_OAUTH_RESOURCE` 配为 Center Origin 时，`/mcp` 的 401 挑战指向路径级元数据，并接受以该 Origin 或其 `/mcp` 地址作为资源参数；令牌继续绑定到原有配置的资源标识，已有令牌无需因该兼容性改动重新签发。
 
 Artifact signing supports a current and previous key simultaneously. New URLs
 use the current `KID`; verification accepts both keys, so rotating the current

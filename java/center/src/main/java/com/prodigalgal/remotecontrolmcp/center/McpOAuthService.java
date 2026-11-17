@@ -20,13 +20,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * Small OAuth 2.1 authorization-code provider for the ChatGPT MCP connection.
+ * Small OAuth 2.1 authorization-code provider for MCP connections.
  *
  * <p>The authorization page accepts an already-issued Console MCP credential as the
- * bootstrap credential.  It never returns that token to ChatGPT; it exchanges
- * it for a short-lived OAuth access token and a rotating refresh token.  This
- * preserves the operator's existing token workflow while satisfying the
- * ChatGPT MCP OAuth contract.  PostgreSQL is authoritative in production and
+ * bootstrap credential. It exchanges it for a short-lived OAuth access token
+ * and a refresh token. PostgreSQL is authoritative in production and
  * the bounded maps keep protocol tests deterministic in memory mode.</p>
  */
 @Service
@@ -128,8 +126,7 @@ public final class McpOAuthService {
     public TokenResponse exchangeAuthorizationCode(String clientId, String redirectUri,
                                                     String code, String codeVerifier, String resource) {
         ensureEnabled();
-        if (clientId == null || !config.validClientId(clientId) || redirectUri == null
-                || !config.validRedirectUri(redirectUri) || code == null || code.isBlank()
+        if (!config.validClientRedirect(clientId, redirectUri) || code == null || code.isBlank()
                 || codeVerifier == null || codeVerifier.isBlank() || !config.validResource(resource)) {
             throw new OAuthException("invalid_grant", "authorization code is invalid");
         }
@@ -171,6 +168,17 @@ public final class McpOAuthService {
                 throw new OAuthException("invalid_grant", "refresh token is invalid");
             }
             return transactions.execute(status -> {
+                if (config.isGeminiClient(clientId)) {
+                    ensureSourceTokenActive(stored.sourceTokenId());
+                    var updated = jdbc.update("""
+                            UPDATE rcm_oauth_refresh_token
+                               SET expires_at = GREATEST(expires_at, ?)
+                             WHERE token_hash = ? AND client_id = ? AND revoked_at IS NULL
+                               AND expires_at > CURRENT_TIMESTAMP
+                            """, timestamp(Instant.now().plus(config.refreshTokenTtl())), hash, clientId);
+                    if (updated != 1) throw new OAuthException("invalid_grant", "refresh token is invalid");
+                    return issueDatabaseAccessToken(stored, value);
+                }
                 var revoked = jdbc.update("""
                         UPDATE rcm_oauth_refresh_token
                            SET revoked_at = CURRENT_TIMESTAMP
@@ -180,11 +188,21 @@ public final class McpOAuthService {
                 return issueDatabaseTokens(stored);
             });
         }
-        var stored = refreshTokens.remove(hash);
-        if (stored == null || !clientId.equals(stored.clientId()) || !Instant.now().isBefore(stored.expiresAt())) {
-            throw new OAuthException("invalid_grant", "refresh token is invalid");
-        }
-        return issueMemoryTokens(stored);
+        var source = new java.util.concurrent.atomic.AtomicReference<OAuthToken>();
+        refreshTokens.compute(hash, (key, stored) -> {
+            if (stored == null || !clientId.equals(stored.clientId()) || !Instant.now().isBefore(stored.expiresAt())) {
+                throw new OAuthException("invalid_grant", "refresh token is invalid");
+            }
+            ensureSourceTokenActive(stored.sourceTokenId());
+            source.set(stored);
+            if (!config.isGeminiClient(clientId)) return null;
+            var expiry = Instant.now().plus(config.refreshTokenTtl());
+            if (stored.expiresAt().isAfter(expiry)) expiry = stored.expiresAt();
+            return new OAuthToken(stored.token(), stored.clientId(), stored.principalId(), stored.sourceTokenId(),
+                    stored.displayName(), stored.scopes(), stored.createdAt(), expiry, null, stored.principal());
+        });
+        return config.isGeminiClient(clientId)
+                ? issueMemoryAccessToken(source.get(), value) : issueMemoryTokens(source.get());
     }
 
     public boolean isEnabledAndConfigured() {
@@ -198,18 +216,9 @@ public final class McpOAuthService {
 
     private TokenResponse issueDatabaseTokens(OAuthToken source) {
         ensureSourceTokenActive(source.sourceTokenId());
-        var access = "rcm_at_" + randomToken();
         var refresh = "rcm_rt_" + randomToken();
         var now = Instant.now();
-        var accessExpiry = now.plus(config.accessTokenTtl());
         var refreshExpiry = now.plus(config.refreshTokenTtl());
-        jdbc.update("""
-                INSERT INTO rcm_oauth_access_token
-                    (token_id, token_hash, principal_id, source_token_id, display_name, client_id, scope_json, resource,
-                     created_at, expires_at, revoked_at)
-                VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, NULL)
-                """, "oauth_at_" + randomHex(16), sha256(access), source.principalId(), source.sourceTokenId(), source.displayName(),
-                source.clientId(), json(source.scopes()), config.resource(), timestamp(now), timestamp(accessExpiry));
         jdbc.update("""
                 INSERT INTO rcm_oauth_refresh_token
                     (token_id, token_hash, principal_id, source_token_id, display_name, client_id, scope_json, resource,
@@ -217,7 +226,22 @@ public final class McpOAuthService {
                 VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, NULL)
                 """, "oauth_rt_" + randomHex(16), sha256(refresh), source.principalId(), source.sourceTokenId(), source.displayName(),
                 source.clientId(), json(source.scopes()), config.resource(), timestamp(now), timestamp(refreshExpiry));
-        return response(access, refresh, accessExpiry, source.scopes());
+        return issueDatabaseAccessToken(source, refresh);
+    }
+
+    private TokenResponse issueDatabaseAccessToken(OAuthToken source, String refresh) {
+        ensureSourceTokenActive(source.sourceTokenId());
+        var access = "rcm_at_" + randomToken();
+        var now = Instant.now();
+        var accessExpiry = now.plus(config.accessTokenTtl());
+        jdbc.update("""
+                INSERT INTO rcm_oauth_access_token
+                    (token_id, token_hash, principal_id, source_token_id, display_name, client_id, scope_json, resource,
+                     created_at, expires_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, NULL)
+                """, "oauth_at_" + randomHex(16), sha256(access), source.principalId(), source.sourceTokenId(), source.displayName(),
+                source.clientId(), json(source.scopes()), config.resource(), timestamp(now), timestamp(accessExpiry));
+        return response(access, refresh, accessExpiry, source.scopes(), source.clientId());
     }
 
     private TokenResponse issueMemoryTokens(AuthorizationCode code) {
@@ -227,18 +251,24 @@ public final class McpOAuthService {
 
     private TokenResponse issueMemoryTokens(OAuthToken source) {
         ensureSourceTokenActive(source.sourceTokenId());
-        var access = "rcm_at_" + randomToken();
         var refresh = "rcm_rt_" + randomToken();
         var now = Instant.now();
-        var accessExpiry = now.plus(config.accessTokenTtl());
         var refreshExpiry = now.plus(config.refreshTokenTtl());
+        refreshTokens.put(sha256(refresh), new OAuthToken("", source.clientId(), source.principalId(),
+                source.sourceTokenId(), source.displayName(), source.scopes(), now, refreshExpiry, null));
+        return issueMemoryAccessToken(source, refresh);
+    }
+
+    private TokenResponse issueMemoryAccessToken(OAuthToken source, String refresh) {
+        ensureSourceTokenActive(source.sourceTokenId());
+        var access = "rcm_at_" + randomToken();
+        var now = Instant.now();
+        var accessExpiry = now.plus(config.accessTokenTtl());
         var principal = new McpPrincipal(source.principalId(), source.sourceTokenId(),
                 source.displayName(), source.scopes(), false, accessExpiry);
-        accessTokens.put(sha256(access), new OAuthToken(access, source.clientId(), source.principalId(),
+        accessTokens.put(sha256(access), new OAuthToken("", source.clientId(), source.principalId(),
                 source.sourceTokenId(), source.displayName(), source.scopes(), now, accessExpiry, null, principal));
-        refreshTokens.put(sha256(refresh), new OAuthToken(refresh, source.clientId(), source.principalId(),
-                source.sourceTokenId(), source.displayName(), source.scopes(), now, refreshExpiry, null, principal));
-        return response(access, refresh, accessExpiry, source.scopes());
+        return response(access, refresh, accessExpiry, source.scopes(), source.clientId());
     }
 
     private void ensureSourceTokenActive(String sourceTokenId) {
@@ -290,7 +320,7 @@ public final class McpOAuthService {
 
     private void validateClient(String clientId, String redirectUri, String codeChallenge,
                                 String codeChallengeMethod, String resource) {
-        if (!config.validClientId(clientId) || !config.validRedirectUri(redirectUri)
+        if (!config.validClientRedirect(clientId, redirectUri)
                 || codeChallenge == null || codeChallenge.isBlank()
                 || !"S256".equalsIgnoreCase(codeChallengeMethod) || !config.validResource(resource)) {
             throw new OAuthException("invalid_request", "OAuth client, redirect URI, resource or PKCE is invalid");
@@ -388,8 +418,9 @@ public final class McpOAuthService {
         return value == null ? null : java.sql.Timestamp.from(value);
     }
 
-    private TokenResponse response(String access, String refresh, Instant expiry, Set<String> scopes) {
-        return new TokenResponse(access, "Bearer", Math.max(1, expiry.getEpochSecond() - Instant.now().getEpochSecond()),
+    private TokenResponse response(String access, String refresh, Instant expiry, Set<String> scopes, String clientId) {
+        return new TokenResponse(access, config.isGeminiClient(clientId) ? "bearer" : "Bearer",
+                Math.max(1, expiry.getEpochSecond() - Instant.now().getEpochSecond()),
                 refresh, String.join(" ", scopes));
     }
 

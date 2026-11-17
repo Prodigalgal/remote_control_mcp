@@ -148,6 +148,57 @@ class PostgresIntegrationTest {
     }
 
     @Test
+    void durableGeminiRefreshSurvivesRetryAndExtendsItsLifetime() throws Exception {
+        var beans = new StaticListableBeanFactory();
+        beans.addBean("jdbc", jdbc);
+        beans.addBean("transactions", transactions);
+        beans.addBean("access", new McpAccessService(jdbc));
+        var principals = new McpPrincipalService(beans.getBeanProvider(JdbcTemplate.class),
+                beans.getBeanProvider(TransactionTemplate.class), beans.getBeanProvider(McpAccessService.class));
+        var resource = "https://remote-control-mcp-center.example.com";
+        var clientId = "gemini-integration";
+        var redirect = "https://oauth-redirect.googleusercontent.com/r/app-integration";
+        var config = new CenterOAuthConfig(Map.of("RCM_CENTER_OAUTH_ENABLED", "true",
+                "RCM_CENTER_OAUTH_ISSUER", resource, "RCM_CENTER_OAUTH_RESOURCE", resource,
+                "RCM_CENTER_OAUTH_GEMINI_CLIENT_ID", clientId,
+                "RCM_CENTER_OAUTH_GEMINI_CLIENT_SECRET", "test-secret",
+                "RCM_CENTER_OAUTH_GEMINI_REDIRECT_URIS", redirect,
+                "RCM_CENTER_OAUTH_REFRESH_TOKEN_TTL_SECONDS", "3600"));
+        var principalId = "gemini_it_" + UUID.randomUUID().toString().replace("-", "");
+        try {
+            var source = principals.issue(new McpPrincipalService.IssueRequest(principalId, "Gemini integration",
+                    7200L, Set.of("mcp:read"), Map.of("oauth-it-machine", Set.of("task_read"))));
+            var service = new McpOAuthService(config, principals, beans.getBeanProvider(JdbcTemplate.class),
+                    beans.getBeanProvider(TransactionTemplate.class));
+            var verifier = "postgres-gemini-verifier-with-more-than-forty-three-characters";
+            var challenge = Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    MessageDigest.getInstance("SHA-256").digest(verifier.getBytes(StandardCharsets.US_ASCII)));
+            var code = service.issueAuthorizationCode(clientId, redirect, challenge, "S256",
+                    "mcp:read offline_access", resource, source.token());
+            var issued = service.exchangeAuthorizationCode(clientId, redirect, code.code(), verifier, resource);
+            jdbc.update("UPDATE rcm_oauth_refresh_token SET expires_at = CURRENT_TIMESTAMP + INTERVAL '1 minute' WHERE principal_id = ?",
+                    principalId);
+
+            var restarted = new McpOAuthService(config, principals, beans.getBeanProvider(JdbcTemplate.class),
+                    beans.getBeanProvider(TransactionTemplate.class));
+            var refreshed = restarted.refresh(clientId, issued.refreshToken(), resource);
+            var retry = restarted.refresh(clientId, issued.refreshToken(), resource);
+            assertEquals(issued.refreshToken(), refreshed.refreshToken());
+            assertEquals(issued.refreshToken(), retry.refreshToken());
+            assertEquals(source.tokenId(), restarted.resolve(retry.accessToken()).orElseThrow().tokenId());
+            var expires = jdbc.queryForObject("SELECT expires_at FROM rcm_oauth_refresh_token WHERE principal_id = ?",
+                    java.sql.Timestamp.class, principalId);
+            assertTrue(expires.toInstant().isAfter(Instant.now().plusSeconds(3000)));
+            assertTrue(principals.revoke(source.tokenId()));
+            assertTrue(restarted.resolve(retry.accessToken()).isEmpty());
+            assertThrows(McpOAuthService.OAuthException.class,
+                    () -> restarted.refresh(clientId, issued.refreshToken(), resource));
+        } finally {
+            jdbc.update("DELETE FROM rcm_principal WHERE principal_id = ?", principalId);
+        }
+    }
+
+    @Test
     void liquibaseSchemaSupportsRegistrationTaskLeaseOutputAndArtifactRoundTrip() throws Exception {
         agentId = "machine_it_" + UUID.randomUUID().toString().replace("-", "");
         var registry = AgentRegistry.forTest("integration-enrollment", jdbc);
